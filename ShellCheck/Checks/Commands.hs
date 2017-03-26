@@ -21,7 +21,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 
 -- This module contains checks that examine specific commands by name.
-module ShellCheck.Checks.Commands (runChecks
+module ShellCheck.Checks.Commands (checker
     , ShellCheck.Checks.Commands.runTests
 ) where
 
@@ -34,8 +34,7 @@ import ShellCheck.Parser
 import ShellCheck.Regex
 
 import Control.Monad
-import Control.Monad.Reader
-import Control.Monad.Writer
+import Control.Monad.RWS
 import Data.Char
 import Data.List
 import Data.Maybe
@@ -49,22 +48,10 @@ data CommandName = Exactly String | Basename String
 data CommandCheck =
     CommandCheck CommandName (Token -> Analysis)
 
-nullCheck :: Token -> Analysis
-nullCheck _ = return ()
-
 
 verify :: CommandCheck -> String -> Bool
-verify f s = producesComments f s == Just True
-verifyNot f s = producesComments f s == Just False
-
-producesComments :: CommandCheck -> String -> Maybe Bool
-producesComments f s = do
-        root <- pScript s
-        return . not . null $ runList (defaultSpec root) [f]
-
-composeChecks f g t = do
-    f t
-    g t
+verify f s = producesComments (getChecker [f]) s == Just True
+verifyNot f s = producesComments (getChecker [f]) s == Just False
 
 arguments (T_SimpleCommand _ _ (cmd:args)) = args
 
@@ -91,13 +78,20 @@ commandChecks = [
     ,checkAliasesUsesArgs
     ,checkAliasesExpandEarly
     ,checkUnsetGlobs
+    ,checkFindWithoutPath
+    ,checkTimeParameters
+    ,checkTimedCommand
+    ,checkLocalScope
+    ,checkDeprecatedTempfile
+    ,checkDeprecatedEgrep
+    ,checkDeprecatedFgrep
     ]
 
 buildCommandMap :: [CommandCheck] -> Map.Map CommandName (Token -> Analysis)
 buildCommandMap = foldl' addCheck Map.empty
   where
     addCheck map (CommandCheck name function) =
-        Map.insertWith' composeChecks name function map
+        Map.insertWith' composeAnalyzers name function map
 
 
 checkCommand :: Map.Map CommandName (Token -> Analysis) -> Token -> Analysis
@@ -115,15 +109,17 @@ checkCommand map t@(T_SimpleCommand id _ (cmd:rest)) = fromMaybe (return ()) $ d
     basename = reverse . takeWhile (/= '/') . reverse
 checkCommand _ _ = return ()
 
-runList spec list = notes
-    where
-        root = asScript spec
-        params = makeParameters spec
-        notes = execWriter $ runReaderT (doAnalysis (checkCommand map) root) params
-        map = buildCommandMap list
+getChecker :: [CommandCheck] -> Checker
+getChecker list = Checker {
+    perScript = const $ return (),
+    perToken = checkCommand map
+    }
+  where
+    map = buildCommandMap list
 
-runChecks spec = runList spec commandChecks
 
+checker :: Parameters -> Checker
+checker params = getChecker commandChecks
 
 prop_checkTr1 = verify checkTr "tr [a-f] [A-F]"
 prop_checkTr2 = verify checkTr "tr 'a-z' 'A-Z'"
@@ -198,23 +194,27 @@ prop_checkGrepRe8 = verify checkGrepRe "ls | grep foo*.jpg"
 prop_checkGrepRe9 = verifyNot checkGrepRe "grep '[0-9]*' file"
 prop_checkGrepRe10= verifyNot checkGrepRe "grep '^aa*' file"
 prop_checkGrepRe11= verifyNot checkGrepRe "grep --include=*.png foo"
+prop_checkGrepRe12= verifyNot checkGrepRe "grep -F 'Foo*' file"
 
-checkGrepRe = CommandCheck (Basename "grep") (f . arguments) where
+checkGrepRe = CommandCheck (Basename "grep") check where
+    check cmd = f cmd (arguments cmd)
     -- --regex=*(extglob) doesn't work. Fixme?
     skippable (Just s) = not ("--regex=" `isPrefixOf` s) && "-" `isPrefixOf` s
     skippable _ = False
-    f [] = return ()
-    f (x:r) | skippable (getLiteralStringExt (const $ return "_") x) = f r
-    f (re:_) = do
+    f _ [] = return ()
+    f cmd (x:r) | skippable (getLiteralStringExt (const $ return "_") x) = f cmd r
+    f cmd (re:_) = do
         when (isGlob re) $
             warn (getId re) 2062 "Quote the grep pattern so the shell won't interpret it."
-        let string = concat $ oversimplify re
-        if isConfusedGlobRegex string then
-            warn (getId re) 2063 "Grep uses regex, but this looks like a glob."
-          else potentially $ do
-            char <- getSuspiciousRegexWildcard string
-            return $ info (getId re) 2022 $
-                "Note that unlike globs, " ++ [char] ++ "* here matches '" ++ [char, char, char] ++ "' but not '" ++ wordStartingWith char ++ "'."
+
+        unless (cmd `hasFlag` "F") $ do
+            let string = concat $ oversimplify re
+            if isConfusedGlobRegex string then
+                warn (getId re) 2063 "Grep uses regex, but this looks like a glob."
+              else potentially $ do
+                char <- getSuspiciousRegexWildcard string
+                return $ info (getId re) 2022 $
+                    "Note that unlike globs, " ++ [char] ++ "* here matches '" ++ [char, char, char] ++ "' but not '" ++ wordStartingWith char ++ "'."
 
     wordStartingWith c =
         head . filter ([c] `isPrefixOf`) $ candidates
@@ -343,7 +343,7 @@ checkInjectableFindSh = CommandCheck (Basename "find") (check . arguments)
 
     pattern = [
         (`elem` ["-exec", "-execdir"]),
-        (`elem` ["sh", "bash", "ksh"]),
+        (`elem` ["sh", "bash", "dash", "ksh"]),
         (== "-c")
         ]
     action (id, arg) =
@@ -363,7 +363,7 @@ checkFindActionPrecedence = CommandCheck (Basename "find") (f . arguments)
         then warnFor (list !! (length pattern - 1))
         else f rest
     isMatch = isParam [ "-name", "-regex", "-iname", "-iregex", "-wholename", "-iwholename" ]
-    isAction = isParam [ "-exec", "-execdir", "-delete", "-print", "-print0" ]
+    isAction = isParam [ "-exec", "-execdir", "-delete", "-print", "-print0", "-fls", "-fprint", "-fprint0", "-fprintf", "-ls", "-ok", "-okdir", "-printf" ]
     isParam strs t = fromMaybe False $ do
         param <- getLiteralString t
         return $ param `elem` strs
@@ -477,6 +477,7 @@ prop_checkPrintfVar7 = verify checkPrintfVar "printf -- foo bar baz"
 prop_checkPrintfVar8 = verifyNot checkPrintfVar "printf '%s %s %s' \"${var[@]}\""
 prop_checkPrintfVar9 = verifyNot checkPrintfVar "printf '%s %s %s\\n' *.png"
 prop_checkPrintfVar10= verifyNot checkPrintfVar "printf '%s %s %s' foo bar baz"
+prop_checkPrintfVar11= verifyNot checkPrintfVar "printf '%(%s%s)T' -1"
 checkPrintfVar = CommandCheck (Exactly "printf") (f . arguments) where
     f (doubledash:rest) | getLiteralString doubledash == Just "--" = f rest
     f (dashv:var:rest) | getLiteralString dashv == Just "-v" = f rest
@@ -486,6 +487,7 @@ checkPrintfVar = CommandCheck (Exactly "printf") (f . arguments) where
     countFormats string =
         case string of
             '%':'%':rest -> countFormats rest
+            '%':'(':rest -> 1 + countFormats (dropWhile (/= ')') rest)
             '%':rest -> 1 + countFormats rest
             _:rest -> countFormats rest
             [] -> 0
@@ -598,6 +600,86 @@ checkUnsetGlobs = CommandCheck (Exactly "unset") (mapM_ check . arguments)
         when (isGlob arg) $
             warn (getId arg) 2184 "Quote arguments to unset so they're not glob expanded."
 
+
+prop_checkFindWithoutPath1 = verify checkFindWithoutPath "find -type f"
+prop_checkFindWithoutPath2 = verify checkFindWithoutPath "find"
+prop_checkFindWithoutPath3 = verifyNot checkFindWithoutPath "find . -type f"
+prop_checkFindWithoutPath4 = verifyNot checkFindWithoutPath "find -H -L \"$path\" -print"
+checkFindWithoutPath = CommandCheck (Basename "find") f
+  where
+    f (T_SimpleCommand _ _ (cmd:args)) =
+        unless (hasPath args) $
+            info (getId cmd) 2185 "Some finds don't have a default path. Specify '.' explicitly."
+
+    -- This is a bit of a kludge. find supports flag arguments both before and after the path,
+    -- as well as multiple non-flag arguments that are not the path. We assume that all the
+    -- pre-path flags are single characters, which is generally the case.
+    hasPath (first:rest) =
+        let flag = fromJust $ getLiteralStringExt (const $ return "___") first in
+            not ("-" `isPrefixOf` flag) || length flag <= 2 && hasPath rest
+    hasPath [] = False
+
+
+prop_checkTimeParameters1 = verify checkTimeParameters "time -f lol sleep 10"
+prop_checkTimeParameters2 = verifyNot checkTimeParameters "time sleep 10"
+prop_checkTimeParameters3 = verifyNot checkTimeParameters "time -p foo"
+prop_checkTimeParameters4 = verifyNot checkTimeParameters "command time -f lol sleep 10"
+checkTimeParameters = CommandCheck (Exactly "time") f
+  where
+    f (T_SimpleCommand _ _ (cmd:args:_)) =
+        whenShell [Bash, Sh] $
+            let s = concat $ oversimplify args in
+                when ("-" `isPrefixOf` s && s /= "-p") $
+                    info (getId cmd) 2023 "The shell may override 'time' as seen in man time(1). Use 'command time ..' for that one."
+
+    f _ = return ()
+
+prop_checkTimedCommand1 = verify checkTimedCommand "#!/bin/sh\ntime -p foo | bar"
+prop_checkTimedCommand2 = verify checkTimedCommand "#!/bin/dash\ntime ( foo; bar; )"
+prop_checkTimedCommand3 = verifyNot checkTimedCommand "#!/bin/sh\ntime sleep 1"
+checkTimedCommand = CommandCheck (Exactly "time") f where
+    f (T_SimpleCommand _ _ (c:args@(_:_))) =
+        whenShell [Sh, Dash] $ do
+            let cmd = last args -- "time" is parsed with a command as argument
+            when (isPiped cmd) $
+                warn (getId c) 2176 "'time' is undefined for pipelines. time single stage or bash -c instead."
+            when (isSimple cmd == Just False) $
+                warn (getId cmd) 2177 "'time' is undefined for compound commands, time sh -c instead."
+    f _ = return ()
+    isPiped cmd =
+        case cmd of
+            T_Pipeline _ _ (_:_:_) -> True
+            _ -> False
+    getCommand cmd =
+        case cmd of
+            T_Pipeline _ _ (T_Redirecting _ _ a : _) -> return a
+            _ -> fail ""
+    isSimple cmd = do
+        innerCommand <- getCommand cmd
+        case innerCommand of
+            T_SimpleCommand {} -> return True
+            _ -> return False
+
+prop_checkLocalScope1 = verify checkLocalScope "local foo=3"
+prop_checkLocalScope2 = verifyNot checkLocalScope "f() { local foo=3; }"
+checkLocalScope = CommandCheck (Exactly "local") $ \t ->
+    whenShell [Bash, Dash] $ do -- Ksh allows it, Sh doesn't support local
+        path <- getPathM t
+        unless (any isFunction path) $
+            err (getId t) 2168 "'local' is only valid in functions."
+
+prop_checkDeprecatedTempfile1 = verify checkDeprecatedTempfile "var=$(tempfile)"
+prop_checkDeprecatedTempfile2 = verifyNot checkDeprecatedTempfile "tempfile=$(mktemp)"
+checkDeprecatedTempfile = CommandCheck (Basename "tempfile") $
+    \t -> warn (getId t) 2186 "tempfile is deprecated. Use mktemp instead."
+
+prop_checkDeprecatedEgrep = verify checkDeprecatedEgrep "egrep '.+'"
+checkDeprecatedEgrep = CommandCheck (Basename "egrep") $
+    \t -> info (getId t) 2196 "egrep is non-standard and deprecated. Use grep -E instead."
+
+prop_checkDeprecatedFgrep = verify checkDeprecatedFgrep "fgrep '*' files"
+checkDeprecatedFgrep = CommandCheck (Basename "fgrep") $
+    \t -> info (getId t) 2197 "fgrep is non-standard and deprecated. Use grep -F instead."
 
 return []
 runTests =  $( [| $(forAllProperties) (quickCheckWithResult (stdArgs { maxSuccess = 1 }) ) |])

@@ -23,6 +23,7 @@ import ShellCheck.AST
 
 import Control.Monad.Writer
 import Control.Monad
+import Data.Functor
 import Data.List
 import Data.Maybe
 
@@ -86,13 +87,14 @@ oversimplify token =
         (T_Glob _ s) -> [s]
         (T_Pipeline _ _ [x]) -> oversimplify x
         (T_Literal _ x) -> [x]
+        (T_ParamSubSpecialChar _ x) -> [x]
         (T_SimpleCommand _ vars words) -> concatMap oversimplify words
         (T_Redirecting _ _ foo) -> oversimplify foo
         (T_DollarSingleQuoted _ s) -> [s]
         (T_Annotation _ _ s) -> oversimplify s
         -- Workaround for let "foo = bar" parsing
         (TA_Sequence _ [TA_Expansion _ v]) -> concatMap oversimplify v
-        otherwise -> []
+        _ -> []
 
 
 -- Turn a SimpleCommand foo -avz --bar=baz into args "a", "v", "z", "bar",
@@ -111,8 +113,11 @@ getFlagsUntil _ _ = error "Internal shellcheck error, please report! (getFlags o
 
 -- Get all flags in a GNU way, up until --
 getAllFlags = getFlagsUntil (== "--")
--- Get all flags in a BSD way, up until first non-flag argument
-getLeadingFlags = getFlagsUntil (not . ("-" `isPrefixOf`))
+-- Get all flags in a BSD way, up until first non-flag argument or --
+getLeadingFlags = getFlagsUntil (\x -> x == "--" || (not $ "-" `isPrefixOf` x))
+
+-- Check if a command has a flag.
+hasFlag cmd str = str `elem` (map snd $ getAllFlags cmd)
 
 
 -- Given a T_DollarBraced, return a simplified version of the string contents.
@@ -170,6 +175,20 @@ getUnquotedLiteral (T_NormalWord _ list) =
     str _ = Nothing
 getUnquotedLiteral _ = Nothing
 
+-- Get the last unquoted T_Literal in a word like "${var}foo"THIS
+-- or nothing if the word does not end in an unquoted literal.
+getTrailingUnquotedLiteral :: Token -> Maybe Token
+getTrailingUnquotedLiteral t =
+    case t of
+        (T_NormalWord _ list@(_:_)) ->
+            from (last list)
+        _ -> Nothing
+  where
+    from t =
+        case t of
+            (T_Literal {}) -> return t
+            _ -> Nothing
+
 -- Maybe get the literal string of this token and any globs in it.
 getGlobOrLiteralString = getLiteralStringExt f
   where
@@ -188,6 +207,7 @@ getLiteralStringExt more = g
     g (TA_Expansion _ l) = allInList l
     g (T_SingleQuoted _ s) = return s
     g (T_Literal _ s) = return s
+    g (T_ParamSubSpecialChar _ s) = return s
     g x = more x
 
 -- Is this token a string literal?
@@ -211,13 +231,25 @@ braceExpand (T_NormalWord id list) = take 1000 $ do
         braceExpand item
     part x = return x
 
--- Maybe get the command name of a token representing a command
-getCommandName t =
+-- Maybe get a SimpleCommand from immediate wrappers like T_Redirections
+getCommand t =
     case t of
-        T_Redirecting _ _ w -> getCommandName w
-        T_SimpleCommand _ _ (w:_) -> getLiteralString w
-        T_Annotation _ _ t -> getCommandName t
+        T_Redirecting _ _ w -> getCommand w
+        T_SimpleCommand _ _ (w:_) -> return t
+        T_Annotation _ _ t -> getCommand t
         otherwise -> Nothing
+
+-- Maybe get the command name of a token representing a command
+getCommandName t = do
+    (T_SimpleCommand _ _ (w:rest)) <- getCommand t
+    s <- getLiteralString w
+    if "busybox" `isSuffixOf` s
+        then
+            case rest of
+                (applet:_) -> getLiteralString applet
+                _ -> return s
+        else
+            return s
 
 -- If a command substitution is a single command, get its name.
 --  $(date +%s) = Just "date"
@@ -255,6 +287,8 @@ isOnlyRedirection t =
 
 isFunction t = case t of T_Function {} -> True; _ -> False
 
+isBraceExpansion t = case t of T_BraceExpansion {} -> True; _ -> False
+
 -- Get the lists of commands from tokens that contain them, such as
 -- the body of while loops or branches of if statements.
 getCommandSequences t =
@@ -276,7 +310,7 @@ getAssociativeArrays t =
     f :: Token -> Writer [String] ()
     f t@(T_SimpleCommand {}) = fromMaybe (return ()) $ do
         name <- getCommandName t
-        guard $ name == "declare"
+        guard $ name == "declare" || name == "typeset"
         let flags = getAllFlags t
         guard $ elem "A" $ map snd flags
         let args = map fst . filter ((==) "" . snd) $ flags
@@ -288,3 +322,65 @@ getAssociativeArrays t =
         case t of
             T_Assignment _ _ name _ _ -> return name
             otherwise -> Nothing
+
+-- A Pseudoglob is a wildcard pattern used for checking if a match can succeed.
+-- For example, [[ $(cmd).jpg == [a-z] ]] will give the patterns *.jpg and ?, which
+-- can be proven never to match.
+data PseudoGlob = PGAny | PGMany | PGChar Char
+    deriving (Eq, Show)
+
+-- Turn a word into a PG pattern, replacing all unknown/runtime values with
+-- PGMany.
+wordToPseudoGlob :: Token -> Maybe [PseudoGlob]
+wordToPseudoGlob word =
+    simplifyPseudoGlob <$> concat <$> mapM f (getWordParts word)
+  where
+    f x = case x of
+        T_Literal _ s -> return $ map PGChar s
+        T_SingleQuoted _ s -> return $ map PGChar s
+
+        T_DollarBraced {} -> return [PGMany]
+        T_DollarExpansion {} -> return [PGMany]
+        T_Backticked {} -> return [PGMany]
+
+        T_Glob _ "?" -> return [PGAny]
+        T_Glob _ ('[':_)  -> return [PGAny]
+        T_Glob {} -> return [PGMany]
+
+        T_Extglob {} -> return [PGMany]
+
+        _ -> return [PGMany]
+
+-- Reorder a PseudoGlob for more efficient matching, e.g.
+-- f?*?**g -> f??*g
+simplifyPseudoGlob :: [PseudoGlob] -> [PseudoGlob]
+simplifyPseudoGlob = f
+  where
+    f [] = []
+    f (x@(PGChar _) : rest ) = x : f rest
+    f list =
+        let (anys, rest) = span (\x -> x == PGMany || x == PGAny) list in
+            order anys ++ f rest
+
+    order s = let (any, many) = partition (== PGAny) s in
+        any ++ take 1 many
+
+-- Check whether the two patterns can ever overlap.
+pseudoGlobsCanOverlap :: [PseudoGlob] -> [PseudoGlob] -> Bool
+pseudoGlobsCanOverlap = matchable
+  where
+    matchable x@(xf:xs) y@(yf:ys) =
+        case (xf, yf) of
+            (PGMany, _) -> matchable x ys || matchable xs y
+            (_, PGMany) -> matchable x ys || matchable xs y
+            (PGAny, _) -> matchable xs ys
+            (_, PGAny) -> matchable xs ys
+            (_, _) -> xf == yf && matchable xs ys
+
+    matchable [] [] = True
+    matchable (PGMany : rest) [] = matchable rest []
+    matchable (_:_) [] = False
+    matchable [] r = matchable r []
+
+wordsCanBeEqual x y = fromMaybe True $
+    liftM2 pseudoGlobsCanOverlap (wordToPseudoGlob x) (wordToPseudoGlob y)

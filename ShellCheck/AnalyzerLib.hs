@@ -29,7 +29,7 @@ import ShellCheck.Regex
 
 import Control.Arrow (first)
 import Control.Monad.Identity
-import Control.Monad.Reader
+import Control.Monad.RWS
 import Control.Monad.State
 import Control.Monad.Writer
 import Data.Char
@@ -40,15 +40,47 @@ import qualified Data.Map as Map
 import Test.QuickCheck.All (forAllProperties)
 import Test.QuickCheck.Test (quickCheckWithResult, stdArgs, maxSuccess)
 
-type Analysis = ReaderT Parameters (Writer [TokenComment]) ()
+type Analysis = AnalyzerM ()
+type AnalyzerM a = RWS Parameters [TokenComment] Cache a
+nullCheck = const $ return ()
 
+
+data Checker = Checker {
+    perScript :: Root -> Analysis,
+    perToken :: Token -> Analysis
+}
+
+runChecker :: Parameters -> Checker -> [TokenComment]
+runChecker params checker = notes
+    where
+        root = rootNode params
+        check = perScript checker `composeAnalyzers` (\(Root x) -> void $ doAnalysis (perToken checker) x)
+        notes = snd $ evalRWS (check $ Root root) params Cache
+
+instance Monoid Checker where
+    mempty = Checker {
+        perScript = nullCheck,
+        perToken = nullCheck
+        }
+    mappend x y = Checker {
+        perScript = perScript x `composeAnalyzers` perScript y,
+        perToken = perToken x `composeAnalyzers` perToken y
+        }
+
+
+composeAnalyzers :: (a -> Analysis) -> (a -> Analysis) -> a -> Analysis
+composeAnalyzers f g x = f x >> g x
 
 data Parameters = Parameters {
     variableFlow :: [StackData],
     parentMap :: Map.Map Id Token,
     shellType :: Shell,
-    shellTypeSpecified :: Bool
+    shellTypeSpecified :: Bool,
+    rootNode :: Token
     }
+
+-- TODO: Cache results of common AST ops here
+data Cache = Cache {}
 
 data Scope = SubshellScope String | NoneScope deriving (Show, Eq)
 data StackData =
@@ -81,6 +113,14 @@ pScript s =
     }
   in prRoot . runIdentity $ parseScript (mockedSystemInterface []) pSpec
 
+-- For testing. If parsed, returns whether there are any comments
+producesComments :: Checker -> String -> Maybe Bool
+producesComments c s = do
+        root <- pScript s
+        let spec = defaultSpec root
+        let params = makeParameters spec
+        return . not . null $ runChecker params c
+
 makeComment :: Severity -> Id -> Code -> String -> TokenComment
 makeComment severity id code note =
     TokenComment id $ Comment severity code note
@@ -95,6 +135,7 @@ style id code str = addComment $ makeComment StyleC id code str
 
 makeParameters spec =
     let params = Parameters {
+        rootNode = root,
         shellType = fromMaybe (determineShell root) $ asShellType spec,
         shellTypeSpecified = isJust $ asShellType spec,
         parentMap = getParentTree root,
@@ -112,6 +153,7 @@ prop_determineShell4 = determineShell (fromJust $ pScript
 prop_determineShell5 = determineShell (fromJust $ pScript
     "#shellcheck shell=sh\nfoo") == Sh
 prop_determineShell6 = determineShell (fromJust $ pScript "#! /bin/sh") == Sh
+prop_determineShell7 = determineShell (fromJust $ pScript "#! /bin/ash") == Dash
 determineShell t = fromMaybe Bash $ do
     shellString <- foldl mplus Nothing $ getCandidates t
     shellForExecutable shellString
@@ -125,8 +167,13 @@ determineShell t = fromMaybe Bash $ do
     getCandidates (T_Annotation _ annotations s) =
         map forAnnotation annotations ++
            [Just $ fromShebang s]
-    fromShebang (T_Script _ s t) = shellFor s
+    fromShebang (T_Script _ s t) = executableFromShebang s
 
+-- Given a string like "/bin/bash" or "/usr/bin/env dash",
+-- return the shell basename like "bash" or "dash"
+executableFromShebang :: String -> String
+executableFromShebang = shellFor
+  where
     shellFor s | "/env " `isInfixOf` s = head (drop 1 (words s)++[""])
     shellFor s | ' ' `elem` s = shellFor $ takeWhile (/= ' ') s
     shellFor s = reverse . takeWhile (/= '/') . reverse $ s
@@ -170,16 +217,13 @@ isQuoteFreeNode strict tree t =
     -- Are any subnodes inherently self-quoting?
     isQuoteFreeContext t =
         case t of
-            TC_Noary _ DoubleBracket _ -> return True
+            TC_Nullary _ DoubleBracket _ -> return True
             TC_Unary _ DoubleBracket _ _ -> return True
             TC_Binary _ DoubleBracket _ _ _ -> return True
             TA_Sequence {} -> return True
             T_Arithmetic {} -> return True
             T_Assignment {} -> return True
-            T_Redirecting {} -> return $
-                if strict then False else
-                    -- Not true, just a hack to prevent warning about non-expansion refs
-                    any (isCommand t) ["local", "declare", "typeset", "export", "trap", "readonly"]
+            T_Redirecting {} -> return False
             T_DoubleQuoted _ _ -> return True
             T_DollarDoubleQuoted _ _ -> return True
             T_CaseExpression {} -> return True
@@ -211,6 +255,10 @@ getClosestCommand tree t =
     getCommand t@(T_Redirecting {}) = return t
     getCommand _ = Nothing
 
+getClosestCommandM t = do
+    tree <- asks parentMap
+    return $ getClosestCommand tree t
+
 usedAsCommandName tree token = go (getId token) (tail $ getPath tree token)
   where
     go currentId (T_NormalWord id [word]:rest)
@@ -226,6 +274,12 @@ getPath tree t = t :
     case Map.lookup (getId t) tree of
         Nothing -> []
         Just parent -> getPath tree parent
+
+-- Version of the above taking the map from the current context
+-- Todo: give this the name "getPath"
+getPathM t = do
+    map <- asks parentMap
+    return $ getPath map t
 
 isParentOf tree parent child =
     elem (getId parent) . map getId $ getPath tree child
@@ -347,6 +401,7 @@ getModifiedVariables t =
             [(t, t, fromMaybe "COPROC" name, DataArray SourceInteger)]
 
         --Points to 'for' rather than variable
+        T_ForIn id str [] _ -> [(t, t, str, DataString $ SourceExternal)]
         T_ForIn id str words _ -> [(t, t, str, DataString $ SourceFrom words)]
         T_SelectIn id str words _ -> [(t, t, str, DataString $ SourceFrom words)]
         _ -> []
@@ -644,6 +699,10 @@ headOrDefault def _ = def
         [] -> Nothing
         (r:_) -> Just r
 
+-- Run a command if the shell is in the given list
+whenShell l c = do
+    shell <- asks shellType
+    when (shell `elem` l ) c
 
 
 filterByAnnotation token =

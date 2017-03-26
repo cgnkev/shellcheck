@@ -33,6 +33,9 @@ internalVariables = [
     -- Other
     "USER", "TZ", "TERM", "LOGNAME", "LD_LIBRARY_PATH", "LANGUAGE", "DISPLAY",
     "HOSTNAME", "KRB5CCNAME", "XAUTHORITY"
+
+    -- Ksh
+    , ".sh.version"
   ]
 
 variablesWithoutSpaces = [
@@ -82,12 +85,24 @@ sampleWords = [
     "zulu"
   ]
 
+binaryTestOps = [
+    "-nt", "-ot", "-ef", "==", "!=", "<=", ">=", "-eq", "-ne", "-lt", "-le",
+    "-gt", "-ge", "=~", ">", "<", "=", "\\<", "\\>", "\\<=", "\\>="
+  ]
+
+unaryTestOps = [
+    "!", "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-k", "-p",
+    "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-O", "-G", "-N", "-z", "-n",
+    "-o", "-v", "-R"
+  ]
+
 shellForExecutable :: String -> Maybe Shell
 shellForExecutable name =
     case name of
         "sh"    -> return Sh
         "bash"  -> return Bash
         "dash"  -> return Dash
+        "ash"   -> return Dash -- There's also a warning for this.
         "ksh"   -> return Ksh
         "ksh88" -> return Ksh
         "ksh93" -> return Ksh

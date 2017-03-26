@@ -36,9 +36,9 @@ Run `shellcheck yourscript` in your terminal for instant output, as seen above.
 
 You can see ShellCheck suggestions directly in a variety of editors.
 
-* Vim, through [Syntastic](https://github.com/scrooloose/syntastic):
+* Vim, through [ALE](https://github.com/w0rp/ale) or [Syntastic](https://github.com/scrooloose/syntastic):
 
-![Screenshot of vim showing inlined shellcheck feedback](doc/vim-syntastic.png).
+![Screenshot of Vim showing inlined shellcheck feedback](doc/vim-syntastic.png).
 
 * Emacs, through [Flycheck](https://github.com/flycheck/flycheck):
 
@@ -54,8 +54,21 @@ You can see ShellCheck suggestions directly in a variety of editors.
 #### In your build or test suites
 While ShellCheck is mostly intended for interactive use, it can easily be added to builds or test suites.
 
-Use ShellCheck's exit code, or its [CheckStyle compatible XML output](shellcheck.1.md#user-content-formats). There's also a simple JSON output format for easy integration.
+ShellCheck makes canonical use of exit codes, and can output simple JSON, CheckStyle compatible XML, GCC compatible warnings as well as human readable text (with or without ANSI colors). See the [Integration](https://github.com/koalaman/shellcheck/wiki/Integration) wiki page for more documentation.
 
+## Travis CI Setup
+
+If you want to use ShellCheck in Travis CI, setting it up is simple :tada:.
+
+```yml
+language: bash
+addons:
+  apt:
+    sources:
+    - debian-sid    # Grab ShellCheck from the Debian repo
+    packages:
+    - shellcheck
+```
 
 ## Installing
 
@@ -64,7 +77,7 @@ The easiest way to install ShellCheck locally is through your package manager.
 On systems with Cabal (installs to `~/.cabal/bin`):
 
     cabal update
-    cabal install shellcheck
+    cabal install ShellCheck
 
 On Debian based distros:
 
@@ -73,6 +86,11 @@ On Debian based distros:
 On Gentoo based distros:
 
     emerge --ask shellcheck
+
+On EPEL based distros:
+
+    yum -y install epel-release
+    yum install ShellCheck
 
 On Fedora based distros:
 
@@ -99,6 +117,9 @@ add OBS devel:languages:haskell repository from https://build.opensuse.org/proje
 
 or use OneClickInstall - https://software.opensuse.org/package/ShellCheck
 
+From Docker Hub:
+
+    docker pull koalaman/shellcheck
 
 ## Compiling from source
 
@@ -107,7 +128,7 @@ This section describes how to build ShellCheck from a source directory. ShellChe
 
 #### Installing Cabal
 
-ShellCheck is built and packaged using Cabal. Install the package `cabal-install` from your system's package manager (with e.g. `apt-get`, `yum`, `zypper` or `brew`).
+ShellCheck is built and packaged using Cabal. Install the package `cabal-install` from your system's package manager (with e.g. `apt-get`, `brew`, `emerge`, `yum`, or `zypper`).
 
 On MacPorts, the package is instead called `hs-cabal-install`, while native Windows users should install the latest version of the Haskell platform from https://www.haskell.org/platform/
 
@@ -183,6 +204,8 @@ ShellCheck can recognize many types of incorrect test statements.
     [ $1 -eq "shellcheck" ]           # Numerical comparison of strings
     [ $n && $m ]                      # && in [ .. ]
     [ grep -q foo file ]              # Command without $(..)
+    [[ "$$file" == *.jpg ]]           # Comparisons that can't succeed
+    (( 1 -lt 2 ))                     # Using test operators in ((..))
 
 
 #### Frequently misused commands
@@ -211,9 +234,11 @@ ShellCheck recognizes many common beginner's syntax errors:
     var$n="Hello"                     # Wrong indirect assignment
     echo ${var$n}                     # Wrong indirect reference
     var=(1, 2, 3)                     # Comma separated arrays
+    array=( [index] = value )         # Incorrect index initialization
     echo "Argument 10 is $10"         # Positional parameter misreference
     if $(myfunction); then ..; fi     # Wrapping commands in $()
     else if othercondition; then ..   # Using 'else if'
+    
 
 
 #### Style
@@ -236,7 +261,8 @@ ShellCheck can recognize issues related to data and typing:
 
     args="$@"                         # Assigning arrays to strings
     files=(foo bar); echo "$files"    # Referencing arrays as strings
-    printf "%s\n" "Arguments: $@."    # Concatenating strings and arrays.
+    declare -A arr=(foo bar)          # Associative arrays without index
+    printf "%s\n" "Arguments: $@."    # Concatenating strings and arrays
     [[ $# > 2 ]]                      # Comparing numbers as strings
     var=World; echo "Hello " var      # Unused lowercase variables
     echo "Hello $name"                # Unassigned lowercase variables
@@ -269,6 +295,7 @@ ShellCheck will warn when using features not supported by the shebang. For examp
     foo-bar() { ..; }                # Undefined/unsupported function name
     [ $UID = 0 ]                     # Variable undefined in dash/sh
     local var=value                  # local is undefined in sh
+    time sleep 1 | sleep 5           # Undefined uses of 'time'
 
 
 #### Miscellaneous
@@ -279,11 +306,13 @@ ShellCheck recognizes a menagerie of other issues:
     PATH="$PATH:~/bin"                # Literal tilde in $PATH
     rm “file”                         # Unicode quotes
     echo "Hello world"                # Carriage return / DOS line endings
+    echo hello \                      # Trailing spaces after \
     var=42 echo $var                  # Expansion of inlined environment
     #!/bin/bash -x -e                 # Common shebang errors
     echo $((n/180*100))               # Unnecessary loss of precision
     ls *[:digit:].txt                 # Bad character class globs
-    sed 's/foo/bar/' file > file       # Redirecting to input
+    sed 's/foo/bar/' file > file      # Redirecting to input
+
 
 
 ## Testimonials
@@ -293,6 +322,11 @@ ShellCheck recognizes a menagerie of other issues:
 Alexander Tarasikov,
 [via Twitter](https://twitter.com/astarasikov/status/568825996532707330)
 
+## Ignoring issues
+
+Issues can be ignored via environmental variable, command line, individually or globally within a file:
+
+https://github.com/koalaman/shellcheck/wiki/Ignore
 
 ## Reporting bugs
 
